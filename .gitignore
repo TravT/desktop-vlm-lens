@@ -1,0 +1,19 @@
+# Binaries and large model weights
+bin/*
+!bin/.gitkeep
+models/*
+!models/.gitkeep
+
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS & runtime cache
+Thumbs.db
+.DS_Store
+.hardware_profile.json
+config.json

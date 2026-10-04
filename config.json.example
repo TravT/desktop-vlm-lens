@@ -1,0 +1,8 @@
+{
+  "device": "auto",
+  "cpu_threads": null,
+  "background_priority": true,
+  "port": 8085,
+  "image_max_tokens": 512,
+  "image_min_tokens": 256
+}
