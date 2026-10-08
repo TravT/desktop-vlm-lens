@@ -1,6 +1,7 @@
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from PIL import Image, ImageDraw
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent

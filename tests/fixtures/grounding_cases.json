@@ -1,0 +1,18 @@
+{
+  "_comment": "Measured with Qwen2.5-VL-3B Q4_K_M + F16 projector on llama.cpp (2026-10-07/08). Same data as dev/ambient-companion/tests/test_grounding.py, so a drift between the two parsers fails in both repos.",
+  "input_sizes": [
+    {"sent": [288, 384], "model_size": [392, 532], "prompt_tokens": 297, "note": "below the 256-token floor, scaled up"},
+    {"sent": [384, 512], "model_size": [392, 532], "prompt_tokens": 297},
+    {"sent": [576, 768], "model_size": [588, 756], "prompt_tokens": 598},
+    {"sent": [768, 1024], "model_size": [756, 1036], "prompt_tokens": 1030}
+  ],
+  "mock_login_page": {
+    "canvas": [1280, 800],
+    "sent": [1024, 640],
+    "elements": [
+      {"name": "Sign in button", "raw": "[382, 437, 654, 478]", "true_centre": [640, 568]},
+      {"name": "Username input", "raw": "[382, 289, 654, 325]", "true_centre": [640, 381]},
+      {"name": "Forgot password link", "raw": "[380, 499, 491, 514]", "true_centre": [535, 630]}
+    ]
+  }
+}

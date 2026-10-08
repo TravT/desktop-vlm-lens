@@ -9,13 +9,15 @@ Runs 100% locally on standard office laptop CPUs (AVX2) with zero admin rights r
 ## 🚀 Key Capabilities
 
 1. **Gives Eyes to Text-Only Models**: Text-only LLMs like **MiniMax 2.7** or terminal-based agents can now visually inspect user interfaces, debug rendered HTML, critique design aesthetics, and read error dialogs.
-2. **Playwright & UI Automation Grounding (`ground_ui_element`)**: Takes a natural language description (e.g. *"First economy news headline link"*), locates it via VLM, and returns normalized bounding boxes `[ymin, xmin, ymax, xmax]` alongside exact pixel click coordinates `(click_x, click_y)` for instant mouse clicks (`page.mouse.click(x, y)`).
+2. **Playwright & UI Automation Grounding (`ground_ui_element`)**: Takes a natural language description (e.g. *"First economy news headline link"*), locates it via VLM, and returns the element's bounding box in pixels `[x1, y1, x2, y2]` of the original image alongside a click point `(click_x, click_y)` for instant mouse clicks (`page.mouse.click(x, y)`). Qwen2.5-VL answers in absolute pixels of the resized image it saw; the lens converts that back to your image, and on a live window capture also returns screen coordinates (`primary_click_screen`).
 3. **Visual Design Verification (`inspect_image_file`)**: Checks layouts, font hierarchy, contrast ratios, and centering on Playwright screenshots without fragile DOM selectors.
 4. **Dual-Mode Screen Capture (`capture_and_inspect`)**:
    - **Active Window Capture**: Focuses exclusively on the foreground application to eliminate multi-monitor sprawl.
    - **Clipboard Ingestion (`Win + Shift + S`)**: Directly inspects snipped screenshots copied to the system clipboard without saving them to disk first.
-5. **Smart 1024px Lanczos Scaling**: Automatically downsamples high-res screens to fit the optimal VLM context budget (~300 tokens) while preserving font sharpness and contrast.
-6. **Self-Healing Auto-Spawn**: Checks if `llama-server` is active on port 8085; if not, transparently launches the local Windows/Linux binary in the background.
+5. **Image budget per question**: Screens are downsampled with Lanczos to a size that fits the question: grounding uses 1024 px (about 1000 visual tokens), reading text uses 768 px (about 600), and every tool takes `detail` = `scene` (512 px) / `read` (768 px) / `precise` (1024 px). Cost grows with the pixel count; on a CPU a cold 1024 px image takes about 40-60 s. Measured click error (17 elements on 3 pages with DOM ground truth, 1280-1920 px canvases): median 33 px at 512 px, 4.6 px at 768 px, 2.2 px at 1024 px. Do not click from a 512 px grounding.
+5b. **Frame reuse**: A live capture returns a `frame_id`. Pass it to the next call (`frame_id`) to ask more questions about the *same* image: no new screenshot, identical pixels, and the server's prompt cache answers in a few seconds instead of re-reading the image. Frames are kept in memory only (3, five minutes) and never written to disk.
+6. **Standalone by design**: The lens only talks to a `llama-server` on **this machine** (`127.0.0.1:8085`), started for you if a binary and a model are under the lens. There is no discovery of other machines and no fallback to one. A non-local `VLM_SERVER_URL` is refused unless you also set `VLM_ALLOW_REMOTE=1`. If no server is available the tool returns a clear error that lists what was tried.
+7. **Self-Healing Auto-Spawn**: Checks if `llama-server` is active on port 8085; if not, transparently launches the local Windows/Linux binary in the background (stock llama.cpp: model plus a separate F16 `mmproj-*.gguf` projector; a single Ollama-format GGUF with the projector embedded also works).
 
 ---
 
@@ -133,7 +135,7 @@ res = call_mcp_tool("desktop-vlm-lens", "ground_ui_element", {
 
 # Response returned:
 # {
-#   "matches": [{"pixel_box": [720, 450, 760, 590], "click_x": 520, "click_y": 740}],
+#   "matches": [{"box_xyxy_pixels": [450, 720, 590, 760], "click_x": 520, "click_y": 740}],
 #   "primary_click": {"x": 520, "y": 740}
 # }
 

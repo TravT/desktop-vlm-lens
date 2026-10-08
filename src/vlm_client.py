@@ -1,52 +1,154 @@
 """
 VLM Client and Self-Healing Auto-Spawn Manager.
-Connects to native llama-server (OpenAI-compatible /v1/chat/completions).
-Transparently launches local llama-server binary on Windows or Linux if port is offline.
+Connects to a llama-server (OpenAI-compatible /v1/chat/completions) on THIS machine.
+
+The lens is a standalone tool: by default it only ever talks to a loopback address. A remote server
+must be named explicitly (VLM_SERVER_URL) and allowed explicitly (VLM_ALLOW_REMOTE=1); there is no
+discovery of other machines and no fallback to one.
 """
 
 import os
 import sys
 import time
 import socket
+import ipaddress
 import subprocess
+import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import requests
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("VLM_TIMEOUT_SEC", "120"))
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8085
+LOCAL_URL = f"http://{LOCAL_HOST}:{LOCAL_PORT}"
+DEFAULT_MIN_IMAGE_TOKENS = 256
+SPAWN_MAX_IMAGE_TOKENS = 1280   # room for a 1024 px image (about 1030 tokens); the client's max_dim sets the real cost
+
+
+@dataclass
+class ServerResolution:
+    """Outcome of looking for a VLM server: a URL, or an error that says what was tried."""
+    url: Optional[str] = None
+    source: Optional[str] = None            # env | running | spawned
+    error: Optional[str] = None
+    error_kind: Optional[str] = None        # no_server | remote_refused
+    tried: List[Dict[str, str]] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+def is_loopback_url(url: str) -> bool:
+    """True when the URL points at this machine."""
+    host = urllib.parse.urlparse(url if "//" in url else f"//{url}").hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def probe_health(base_url: str, timeout: float = 0.8) -> str:
+    """'ready' (200), 'loading' (503 while the model loads) or 'down'. Read-only GET, nothing is started."""
+    try:
+        r = requests.get(f"{base_url.rstrip('/')}/health", timeout=timeout)
+    except Exception:
+        return "down"
+    if r.status_code == 200:
+        return "ready"
+    if r.status_code == 503:
+        return "loading"
+    return "down"
+
+
+def image_token_limits() -> Tuple[int, Optional[int]]:
+    """(min, max) image tokens the server is assumed to run with; max None means no cap.
+
+    The grounding parser needs the same numbers the server uses to know what size the model saw.
+    """
+    lo, hi = DEFAULT_MIN_IMAGE_TOKENS, None
+    cfg = _user_config()
+    if cfg.get("image_min_tokens"):
+        lo = int(cfg["image_min_tokens"])
+    if cfg.get("image_max_tokens"):
+        hi = int(cfg["image_max_tokens"])
+    if os.environ.get("VLM_MIN_IMAGE_TOKENS"):
+        lo = int(os.environ["VLM_MIN_IMAGE_TOKENS"])
+    if os.environ.get("VLM_MAX_IMAGE_TOKENS"):
+        hi = int(os.environ["VLM_MAX_IMAGE_TOKENS"])
+    return lo, hi
+
+
+def _user_config() -> Dict[str, Any]:
+    config_path = PACKAGE_ROOT / "config.json"
+    if config_path.exists():
+        try:
+            import json
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def resolve_server() -> ServerResolution:
+    """
+    Finds a VLM server on this machine, in this order:
+    1. VLM_SERVER_URL (must be loopback unless VLM_ALLOW_REMOTE=1)
+    2. a server already listening on 127.0.0.1:8085
+    3. auto-spawn of a local llama-server, when a binary and a model are present
+    Otherwise returns an error that lists what was tried. Nothing else is contacted.
+    """
+    res = ServerResolution()
+    env_url = (os.environ.get("VLM_SERVER_URL") or "").strip()
+
+    if env_url:
+        if not is_loopback_url(env_url) and os.environ.get("VLM_ALLOW_REMOTE") != "1":
+            res.error_kind = "remote_refused"
+            res.error = (f"VLM_SERVER_URL points to a non-local address ({env_url}). The lens is standalone and "
+                         f"only talks to this machine unless VLM_ALLOW_REMOTE=1 is set.")
+            return res
+        state = probe_health(env_url)
+        res.tried.append({"url": env_url, "reason": "VLM_SERVER_URL: " + ("up" if state != "down" else "not answering")})
+        if state != "down":
+            res.url, res.source = env_url, "env"
+            return res
+        res.error_kind = "no_server"
+        res.error = f"No VLM server answered at VLM_SERVER_URL ({env_url}). Start it, or unset VLM_SERVER_URL."
+        return res
+
+    state = probe_health(LOCAL_URL, timeout=0.3)
+    res.tried.append({"url": LOCAL_URL, "reason": "local server: " + ("up" if state != "down" else "not listening")})
+    if state != "down":
+        res.url, res.source = LOCAL_URL, "running"
+        return res
+
+    server_bin = find_local_binary()
+    model_file, mmproj_file = find_local_model()
+    if server_bin and model_file:
+        warn = mmproj_warning(mmproj_file) if mmproj_file else None
+        if warn:
+            res.notes.append(warn)
+        if auto_spawn_llama_server(LOCAL_HOST, LOCAL_PORT):
+            res.url, res.source = LOCAL_URL, "spawned"
+            return res
+        res.tried.append({"url": LOCAL_URL, "reason": f"auto-spawn of {server_bin.name} did not become ready"})
+    else:
+        missing = "llama-server binary" if not server_bin else "model file"
+        res.tried.append({"url": LOCAL_URL, "reason": f"auto-spawn skipped: no {missing} under the lens"})
+
+    res.error_kind = "no_server"
+    res.error = (f"No VLM server is available. Tried: " + "; ".join(f"{t['url']} ({t['reason']})" for t in res.tried) +
+                 f". Start a llama-server with a vision model on {LOCAL_URL}, "
+                 f"or put a llama-server binary and a model under the lens (python scripts/fetch_models.py).")
+    return res
 
 
 def resolve_best_server_url() -> str:
-    """
-    Auto-discovers the best available VLM endpoint:
-    1. VLM_SERVER_URL env var if explicitly configured
-    2. Local port 8085 if already listening
-    3. If local model and binary exist, auto-spawn on 127.0.0.1:8085 (SPLIT-SECOND GPU INFERENCE)
-    4. Fall back to homelab vlm-native.home.arpa only if no local model exists
-    """
-    env_url = os.environ.get("VLM_SERVER_URL")
-    if env_url:
-        return env_url
-
-    if is_server_ready("127.0.0.1", 8085, timeout=0.3):
-        return "http://127.0.0.1:8085"
-
-    # Prioritize local auto-spawn with GPU offload before remote fallback
-    server_bin = find_local_binary()
-    model_file, _ = find_local_model()
-    if server_bin and model_file:
-        if auto_spawn_llama_server("127.0.0.1", 8085):
-            return "http://127.0.0.1:8085"
-
-    try:
-        r = requests.get("http://vlm-native.home.arpa/health", timeout=1.0)
-        if r.status_code == 200:
-            return "http://vlm-native.home.arpa"
-    except Exception:
-        pass
-
-    return "http://127.0.0.1:8085"
+    """URL of the server to use, or '' when none is available (see resolve_server for the reason)."""
+    return resolve_server().url or ""
 
 
 def is_port_open(host: str = "127.0.0.1", port: int = 8085, timeout: float = 0.5) -> bool:
@@ -101,7 +203,12 @@ def find_local_binary() -> Optional[Path]:
 
 
 def find_local_model() -> tuple[Optional[Path], Optional[Path]]:
-    """Discovers GGUF model and vision projector mmproj in models/ directory."""
+    """Finds the GGUF model and its vision projector in models/.
+
+    Stock llama.cpp layout: the model plus a separate `mmproj-*.gguf`, which must stay F16 (a quantized
+    projector breaks spatial grounding). A single GGUF with no projector file is treated as an
+    Ollama-format file whose projector is embedded.
+    """
     models_dir = PACKAGE_ROOT / "models"
     if not models_dir.exists():
         return None, None
@@ -109,17 +216,25 @@ def find_local_model() -> tuple[Optional[Path], Optional[Path]]:
     model_file = None
     mmproj_file = None
 
-    for f in models_dir.glob("*.gguf"):
+    for f in sorted(models_dir.glob("*.gguf")):
         if "mmproj" in f.name.lower():
             mmproj_file = f
         else:
             model_file = f
 
-    # In unified Ollama-format GGUFs (e.g. Qwen2.5-VL), mmproj is embedded in the model GGUF itself
+    # Ollama-format single-file GGUF (projector embedded in the model file)
     if model_file and not mmproj_file:
         mmproj_file = model_file
 
     return model_file, mmproj_file
+
+
+def mmproj_warning(mmproj_file: Path) -> Optional[str]:
+    """Warns when a projector file name says it is quantized (grounding needs F16)."""
+    name = mmproj_file.name.lower()
+    if "mmproj" in name and any(q in name for q in ("q4", "q5", "q6", "q8", "int8")):
+        return f"Projector {mmproj_file.name} looks quantized; keep the projector F16 or UI grounding degrades."
+    return None
 
 
 def auto_spawn_llama_server(host: str = "127.0.0.1", port: int = 8085) -> bool:
@@ -134,8 +249,9 @@ def auto_spawn_llama_server(host: str = "127.0.0.1", port: int = 8085) -> bool:
     threads = 4
     threads_batch = 8
     ngl = 99
-    max_tokens = int(os.environ.get("VLM_MAX_IMAGE_TOKENS", "512"))
-    min_tokens = int(os.environ.get("VLM_MIN_IMAGE_TOKENS", "256"))
+    # Same limits the grounding parser assumes (image_token_limits); no cap means room for a 1024 px image.
+    min_tokens, max_cap = image_token_limits()
+    max_tokens = max_cap or SPAWN_MAX_IMAGE_TOKENS
     background_priority = True
 
     # 1. Check user config.json first
@@ -151,10 +267,6 @@ def auto_spawn_llama_server(host: str = "127.0.0.1", port: int = 8085) -> bool:
                 threads = int(user_cfg["cpu_threads"])
             if user_cfg.get("background_priority") is not None:
                 background_priority = bool(user_cfg["background_priority"])
-            if user_cfg.get("image_max_tokens"):
-                max_tokens = int(user_cfg["image_max_tokens"])
-            if user_cfg.get("image_min_tokens"):
-                min_tokens = int(user_cfg["image_min_tokens"])
         except Exception:
             pass
 
@@ -259,27 +371,39 @@ def query_vlm(
     """
     Sends multimodal inference query to the VLM server.
     """
-    if not server_url:
-        server_url = resolve_best_server_url()
-
-    # Parse host & port for liveness check
-    import urllib.parse
-    parsed = urllib.parse.urlparse(server_url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 8085
-
-    # Auto-spawn if localhost and currently offline or loading
-    if host in ("127.0.0.1", "localhost") and not is_server_ready(host, port):
-        if not is_port_open(host, port):
-            auto_spawn_llama_server(host, port)
-        else:
-            # Socket open but model loading, wait for readiness
-            for _ in range(60):
-                time.sleep(0.5)
-                if is_server_ready(host, port):
-                    break
-
     family = detect_model_family()
+    if server_url:
+        if not is_loopback_url(server_url) and os.environ.get("VLM_ALLOW_REMOTE") != "1":
+            return {
+                "status": "error",
+                "error_kind": "remote_refused",
+                "error": f"Refusing non-local VLM server '{server_url}': the lens is standalone (set VLM_ALLOW_REMOTE=1 to allow it).",
+                "duration_sec": 0.0,
+                "model_family": family
+            }
+    else:
+        resolution = resolve_server()
+        if not resolution.url:
+            return {
+                "status": "error",
+                "error_kind": resolution.error_kind or "no_server",
+                "error": resolution.error,
+                "tried": resolution.tried,
+                "duration_sec": 0.0,
+                "model_family": family
+            }
+        server_url = resolution.url
+
+    # Socket open but model still loading: wait for readiness
+    parsed = urllib.parse.urlparse(server_url)
+    host = parsed.hostname or LOCAL_HOST
+    port = parsed.port or LOCAL_PORT
+    if is_loopback_url(server_url) and is_port_open(host, port) and not is_server_ready(host, port):
+        for _ in range(60):
+            time.sleep(0.5)
+            if is_server_ready(host, port):
+                break
+
     endpoint = f"{server_url.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": "qwen2.5-vl" if family == "qwen" else family,

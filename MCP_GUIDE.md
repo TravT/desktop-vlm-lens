@@ -9,7 +9,7 @@ Runs 100% locally on CPU with **zero audio overhead**, **zero external network e
 ## 🚀 Key Capabilities
 
 1. **Gives Vision to Text-Only Models**: Text-only LLMs like **MiniMax 2.7** or terminal-based agents can now inspect user interfaces, debug canvas elements, and read error dialogs.
-2. **Playwright & UI Automation Grounding (`ground_ui_element`)**: Takes a natural language description (e.g. *"Blue Submit button"*), locates it via `Qwen2.5-VL-3B`, and returns normalized bounding boxes `[ymin, xmin, ymax, xmax]` alongside exact pixel click coordinates `(click_x, click_y)` for instant mouse clicks.
+2. **Playwright & UI Automation Grounding (`ground_ui_element`)**: Takes a natural language description (e.g. *"Blue Submit button"*), locates it via `Qwen2.5-VL-3B`, and returns the bounding box in pixels `[x1, y1, x2, y2]` (`box_xyxy_pixels`) plus a click point `(click_x, click_y)` in pixels of the original image for instant mouse clicks.
 3. **Dual-Mode Screen Capture**:
    - **Active Window Capture**: Focuses exclusively on the foreground application to eliminate multi-monitor sprawl (e.g., 5120×1440 canvas shrinking buttons into unreadable dots).
    - **Clipboard Ingestion (`Win + Shift + S`)**: Directly inspects snipped screenshots copied to the system clipboard without saving them to disk first.
@@ -67,17 +67,17 @@ In your harness MCP settings JSON:
 
 ---
 
-## 🐧 Linux Setup (Homelab & Nomad Cluster)
+## 🐧 Linux Setup
 
-In the homelab, the tool connects to the existing native `llama-server` managed by Nomad on port 8085:
+The tool uses a `llama-server` on this machine, port 8085 (it starts one if it finds a binary and a model under the lens). It never looks for other machines. A server on another host can be used only by setting both `VLM_SERVER_URL` and `VLM_ALLOW_REMOTE=1`.
 
 ### 1. Run via Shell Launcher
 ```bash
 ./start_linux.sh
 ```
 
-### 2. Homelab Nomad Integration
-The script auto-detects `http://127.0.0.1:8085` or `http://vlm-native.home.arpa:8085` (from `nomad_jobs/llama-cpp.nomad`).
+### 2. Existing local server
+The script uses whatever is listening on `http://127.0.0.1:8085` (for example a `llama-server` you started, or a container publishing that port). If nothing is, the tool returns an error that says what was tried.
 
 ---
 
@@ -97,7 +97,7 @@ res = call_mcp_tool("desktop-vlm-lens", "ground_ui_element", {
 
 # Response returned:
 # {
-#   "matches": [{"pixel_box": [720, 450, 760, 590], "click_x": 520, "click_y": 740}],
+#   "matches": [{"box_xyxy_pixels": [450, 720, 590, 760], "click_x": 520, "click_y": 740}],
 #   "primary_click": {"x": 520, "y": 740}
 # }
 

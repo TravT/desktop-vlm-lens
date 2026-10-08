@@ -77,15 +77,19 @@ with sync_playwright() as p:
   ```json
   {
     "element_description": "Submit button",
+    "click_space": "image",
     "primary_click": {"x": 640, "y": 480},
     "matches": [
       {
-        "pixel_box": [620, 460, 660, 500],
-        "normalized_box": [638, 480, 694, 520]
+        "box_xyxy_pixels": [620, 460, 660, 500],
+        "click_x": 640,
+        "click_y": 480
       }
     ]
   }
   ```
+  `primary_click` is in pixels of the image you gave it (a Playwright screenshot at device scale 1 is the page's CSS pixels, so `page.mouse.click(x, y)` works directly). For a live `active_window` capture it is window-relative and `primary_click_screen` holds the screen position.
+  If the result carries a `scale_hint` (large canvas, small target), call again with `crop_bbox` around the target.
 
 ### `inspect_image_file`
 - **Arguments**:

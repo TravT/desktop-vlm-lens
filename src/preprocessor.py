@@ -6,6 +6,7 @@ Supports Region-of-Interest (RoI) crop-on-demand with automated coordinate re-ma
 
 import io
 import re
+import math
 import base64
 from typing import Tuple, Optional, Dict, Any, List
 from PIL import Image
@@ -168,78 +169,143 @@ def encode_image_base64(img: Image.Image, format_str: str = "JPEG", quality: int
     return f"data:{mime};base64,{raw_b64}"
 
 
+QWEN_FACTOR = 28            # 14 px patches, merged 2x2
+QWEN_TEMPLATE_TOKENS = 31   # chat-template tokens around the image grid (measured: tokens = grid + 31)
+TOKEN_TOLERANCE = 64        # slack for the prompt text when comparing expected and reported prompt tokens
+
+
+def qwen_input_size(
+    width: int,
+    height: int,
+    min_tokens: int = 256,
+    max_tokens: Optional[int] = None,
+    factor: int = QWEN_FACTOR,
+) -> Tuple[int, int]:
+    """Size (w, h) of an image as Qwen2.5-VL sees it after llama.cpp's resize.
+
+    Both sides are rounded to multiples of 28; images under the --image-min-tokens floor are scaled up and,
+    when --image-max-tokens is set, images over the cap are scaled down. Qwen2.5-VL answers grounding
+    queries in absolute pixels of THIS image, not of the file that was sent.
+    """
+    w_bar = max(factor, int(math.floor(width / factor + 0.5)) * factor)
+    h_bar = max(factor, int(math.floor(height / factor + 0.5)) * factor)
+    min_pixels = min_tokens * factor * factor
+    if max_tokens and w_bar * h_bar > max_tokens * factor * factor:
+        beta = math.sqrt(width * height / float(max_tokens * factor * factor))
+        w_bar = max(factor, int(math.floor(width / beta / factor)) * factor)
+        h_bar = max(factor, int(math.floor(height / beta / factor)) * factor)
+    elif w_bar * h_bar < min_pixels:
+        beta = math.sqrt(min_pixels / float(width * height))
+        w_bar = int(math.ceil(width * beta / factor)) * factor
+        h_bar = int(math.ceil(height * beta / factor)) * factor
+    return w_bar, h_bar
+
+
+def expected_prompt_tokens(model_size: Tuple[int, int], factor: int = QWEN_FACTOR) -> int:
+    """Image grid tokens plus the chat template, for a prompt of a few words."""
+    return (model_size[0] // factor) * (model_size[1] // factor) + QWEN_TEMPLATE_TOKENS
+
+
+def infer_model_size(prompt_tokens: int, width: int, height: int, factor: int = QWEN_FACTOR) -> Tuple[int, int]:
+    """Model-seen size recovered from the server's prompt token count and the sent aspect ratio."""
+    grid = max(1, prompt_tokens - QWEN_TEMPLATE_TOKENS)
+    area = grid * factor * factor
+    ratio = width / float(height)
+    w_bar = max(factor, int(round(math.sqrt(area * ratio) / factor)) * factor)
+    h_bar = max(factor, int(round(math.sqrt(area / ratio) / factor)) * factor)
+    return w_bar, h_bar
+
+
+def resolve_model_size(
+    width: int,
+    height: int,
+    prompt_tokens: Optional[int] = None,
+    min_tokens: int = 256,
+    max_tokens: Optional[int] = None,
+) -> Tuple[Tuple[int, int], str]:
+    """The size the model saw, and where it came from: 'computed' or 'inferred'.
+
+    The computed size is trusted when the server's prompt token count agrees with it. A disagreement
+    means the server runs with different image-token limits than we assume (for example a lower
+    --image-max-tokens), so the size is recovered from the token count instead.
+    """
+    size = qwen_input_size(width, height, min_tokens, max_tokens)
+    if prompt_tokens and abs(prompt_tokens - expected_prompt_tokens(size)) > TOKEN_TOLERANCE:
+        return infer_model_size(prompt_tokens, width, height), "inferred"
+    return size, "computed"
+
+
+_BOX_RE = re.compile(r"[\[\(]\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*[\]\)]")
+
+
 def parse_grounding_coordinates(
     model_output: str,
     orig_width: int,
     orig_height: int,
-    crop_info: Optional[Dict[str, Any]] = None
+    crop_info: Optional[Dict[str, Any]] = None,
+    model_size: Optional[Tuple[int, int]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Extracts 2D bounding boxes in format [ymin, xmin, ymax, xmax] from model output
-    and calculates exact pixel click coordinates for UI automation.
-    If crop_info is provided, re-maps local crop coordinates back to full canvas space.
+    Extracts 2D boxes from model output and computes pixel click coordinates on the full canvas.
+
+    With `model_size` (the image size the model saw, see resolve_model_size) the four numbers are
+    Qwen2.5-VL's native absolute pixels [x1, y1, x2, y2]. Without it they are read as normalized
+    0-1000 or 0-1 [ymin, xmin, ymax, xmax] (other model families, older callers).
+    If crop_info is provided, local crop coordinates are re-mapped to the full canvas.
+    Result fields: pixel_box [ymin, xmin, ymax, xmax], box_xyxy_pixels [x1, y1, x2, y2],
+    click_x, click_y on the canvas (the original capture, not the downscaled image).
     """
-    matches = re.findall(r"[\[\(]\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*[\]\)]", model_output)
     results = []
 
     is_cropped = bool(crop_info and crop_info.get("applied"))
     if is_cropped:
-        ref_w = crop_info["crop_width"]
-        ref_h = crop_info["crop_height"]
-        offset_x = crop_info["x_offset"]
-        offset_y = crop_info["y_offset"]
+        ref_w, ref_h = crop_info["crop_width"], crop_info["crop_height"]
+        offset_x, offset_y = crop_info["x_offset"], crop_info["y_offset"]
     else:
-        ref_w = orig_width
-        ref_h = orig_height
-        offset_x = 0
-        offset_y = 0
+        ref_w, ref_h = orig_width, orig_height
+        offset_x = offset_y = 0
 
-    for m in matches:
+    for m in _BOX_RE.findall(model_output or ""):
         try:
-            ymin, xmin, ymax, xmax = map(float, m)
+            a, b, c, d = map(float, m)
         except ValueError:
             continue
 
-        max_val = max(ymin, xmin, ymax, xmax)
-        if max_val <= 1.0:
-            # 0.0 - 1.0 normalized
-            local_ymin = int(round(ymin * ref_h))
-            local_xmin = int(round(xmin * ref_w))
-            local_ymax = int(round(ymax * ref_h))
-            local_xmax = int(round(xmax * ref_w))
-        elif max_val <= 1000.0:
-            # 0 - 1000 normalized (Qwen-VL default)
-            local_ymin = int(round(ymin * ref_h / 1000.0))
-            local_xmin = int(round(xmin * ref_w / 1000.0))
-            local_ymax = int(round(ymax * ref_h / 1000.0))
-            local_xmax = int(round(xmax * ref_w / 1000.0))
+        if model_size:
+            mw, mh = model_size
+            x1, x2 = sorted((max(0.0, min(float(mw), a)), max(0.0, min(float(mw), c))))
+            y1, y2 = sorted((max(0.0, min(float(mh), b)), max(0.0, min(float(mh), d))))
+            local_xmin = int(round(x1 / mw * ref_w))
+            local_xmax = int(round(x2 / mw * ref_w))
+            local_ymin = int(round(y1 / mh * ref_h))
+            local_ymax = int(round(y2 / mh * ref_h))
+            ymin, xmin, ymax, xmax = (round(y1 / mh * 1000), round(x1 / mw * 1000),
+                                      round(y2 / mh * 1000), round(x2 / mw * 1000))
         else:
-            # Absolute pixel coordinates
-            local_ymin = int(round(ymin))
-            local_xmin = int(round(xmin))
-            local_ymax = int(round(ymax))
-            local_xmax = int(round(xmax))
+            ymin, xmin, ymax, xmax = a, b, c, d
+            max_val = max(ymin, xmin, ymax, xmax)
+            if max_val <= 1.0:
+                scale_y, scale_x = ref_h, ref_w                          # 0.0 - 1.0 normalized
+            elif max_val <= 1000.0:
+                scale_y, scale_x = ref_h / 1000.0, ref_w / 1000.0        # 0 - 1000 normalized
+            else:
+                scale_y = scale_x = 1.0                                  # absolute pixels
+            local_ymin, local_xmin = int(round(ymin * scale_y)), int(round(xmin * scale_x))
+            local_ymax, local_xmax = int(round(ymax * scale_y)), int(round(xmax * scale_x))
 
-        # Remap to full canvas coordinate space
-        px_ymin = offset_y + local_ymin
-        px_xmin = offset_x + local_xmin
-        px_ymax = offset_y + local_ymax
-        px_xmax = offset_x + local_xmax
-
-        # Exact center click point
-        click_x = int(round((px_xmin + px_xmax) / 2.0))
-        click_y = int(round((px_ymin + px_ymax) / 2.0))
+        px_ymin, px_xmin = offset_y + local_ymin, offset_x + local_xmin
+        px_ymax, px_xmax = offset_y + local_ymax, offset_x + local_xmax
 
         item = {
             "normalized_box": [ymin, xmin, ymax, xmax],
             "pixel_box": [px_ymin, px_xmin, px_ymax, px_xmax],
-            "click_x": click_x,
-            "click_y": click_y
+            "box_xyxy_pixels": [px_xmin, px_ymin, px_xmax, px_ymax],
+            "click_x": int(round((px_xmin + px_xmax) / 2.0)),
+            "click_y": int(round((px_ymin + px_ymax) / 2.0)),
         }
         if is_cropped:
             item["crop_relative_box"] = [local_ymin, local_xmin, local_ymax, local_xmax]
             item["remapped_from_crop"] = True
-
         results.append(item)
 
     return results

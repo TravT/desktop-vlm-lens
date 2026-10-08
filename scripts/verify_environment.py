@@ -77,8 +77,8 @@ def check_binaries():
 
 
 def check_server_health(model_profile):
-    url = vlm_client.resolve_best_server_url()
-    print(f"\n--- Checking Server Endpoint: {url} ---")
+    res = vlm_client.resolve_server()
+    print(f"\n--- Checking Server Endpoint: {res.url or 'none (' + str(res.error) + ')'} ---")
     active = vlm_client.is_port_open(port=8085)
     if active:
         print("  [OK] Local port 8085 is ACTIVE and listening.")
@@ -96,7 +96,7 @@ def check_server_health(model_profile):
     print("\n--- Model Capabilities & Limitations Profile ---")
     if model_profile == "qwen2.5-vl-3b":
         print("  * Profile: Qwen2.5-VL-3B (Tier 1: Full Power)")
-        print("     - ground_ui_element: FULL SUPPORT (Pixel-accurate click targets)")
+        print("     - ground_ui_element: FULL SUPPORT (click targets from pixel boxes at 1024 px)")
         print("     - inspect_image_file: FULL SUPPORT (UI layout, contrast, design critique)")
         print("     - transcribe_screen_text: FULL SUPPORT (Dense multilingual OCR)")
     elif model_profile == "moondream2":
