@@ -31,7 +31,7 @@ import preprocessor
 import vlm_client
 
 SERVER_NAME = "desktop-vlm-lens"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.1.1"
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -235,6 +235,8 @@ for _tool in TOOLS:
         _props["detail"] = _DETAIL_PROP
     if _tool["name"] in ("capture_and_inspect", "transcribe_screen_text", "ground_ui_element"):
         _props["frame_id"] = _FRAME_PROP
+    # MCP requires `inputSchema`; `parameters` is kept as an alias for harnesses that read the old key.
+    _tool["inputSchema"] = _tool["parameters"]
 
 
 def budget_px(detail: str) -> int:
