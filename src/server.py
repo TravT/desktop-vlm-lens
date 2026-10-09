@@ -31,7 +31,7 @@ import preprocessor
 import vlm_client
 
 SERVER_NAME = "desktop-vlm-lens"
-SERVER_VERSION = "2.1.1"
+SERVER_VERSION = "2.2.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -205,14 +205,15 @@ TOOLS = [
 # Image budgets: the cost of a call is linear in visual tokens, so each question gets the smallest
 # image that answers it. Measured on 17 elements of 3 pages with DOM ground truth (Dell, stock Qwen2.5-VL-3B):
 # click error median 33 px at 512 px (7/17 inside the element), 4.6 px at 768 px, 2.2 px at 1024 px; on the
-# 1920 px page 768 px was 4x worse than 1024 px, so grounding stays at 1024 px. Reading showed no gain
-# from 1024 px over 768 px, so transcription uses 768 px.
+# 1920 px page 768 px was 4x worse than 1024 px, so grounding stays at 1024 px. Reading small text is worse
+# still: on a 1080p canvas with unguessable 8-16 px codes, 768 px read 0/36, 1024 px read 12/36 and a native
+# crop (crop_bbox) read 36/36, so transcription defaults to 1024 px and warns when the image was shrunk a lot.
 BUDGET_PX = {"scene": 512, "read": 768, "precise": 1024}
 BUDGET_ENV = {"scene": "VLM_SCENE_PX", "read": "VLM_READ_PX", "precise": "VLM_PRECISE_PX"}
 DEFAULT_DETAIL = {
     "capture_and_inspect": "precise",
     "inspect_image_file": "precise",
-    "transcribe_screen_text": "read",
+    "transcribe_screen_text": "precise",
     "ground_ui_element": "precise",
 }
 
@@ -221,7 +222,7 @@ FRAMES = frames.FrameStore()
 _DETAIL_PROP = {
     "type": "string",
     "enum": ["scene", "read", "precise"],
-    "description": ("Image size sent to the model: 'scene' 512 px (fast overview), 'read' 768 px (text), "
+    "description": ("Image size sent to the model: 'scene' 512 px (fast overview), 'read' 768 px (large text only), "
                     "'precise' 1024 px (small text, UI details). Cost grows with the pixel count."),
 }
 _FRAME_PROP = {
@@ -307,6 +308,21 @@ def _prepare(tool_name: str, args: Dict[str, Any], err_prefix: str = "Capture Er
         "prep": prep_meta,
         "b64": preprocessor.encode_image_base64(img_processed),
     }, None
+
+
+SHRINK_NOTE_FROM = 1.5
+
+
+def _shrink_note(cap_meta: Dict[str, Any], prep_meta: Dict[str, Any]) -> str:
+    """Warning line for reading tools when the image was shrunk enough to lose small text."""
+    ci = prep_meta.get("crop_info") if prep_meta.get("crop_applied") else None
+    ref_w = ci["crop_width"] if ci else cap_meta.get("original_width")
+    sent_w = prep_meta.get("processed_width")
+    if not ref_w or not sent_w or ref_w / sent_w < SHRINK_NOTE_FROM:
+        return ""
+    scale = ref_w / sent_w
+    return (f"- **Note**: the image was shrunk {scale:.1f}x to fit the model; text smaller than about {int(10 * scale)} px "
+            f"is unreliable. For small print pass crop_bbox around it (a native crop read every code, a shrunk full screen did not).\n")
 
 
 def _frame_line(cap_meta: Dict[str, Any]) -> str:
@@ -512,6 +528,7 @@ def handle_tool_call(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 f"- **Source**: {cap_meta.get('source')} ({cap_meta.get('original_width')}x{cap_meta.get('original_height')})\n"
                 f"{_frame_line(cap_meta)}"
                 f"{crop_note}"
+                f"{_shrink_note(cap_meta, prep_meta)}"
                 f"- **Transcribed Content**:\n{res.get('content')}\n\n"
                 f"- **Latency**: {res.get('duration_sec')}s"
             )

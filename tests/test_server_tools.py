@@ -164,7 +164,7 @@ class TestBudgets(ToolTestCase):
 
     def test_default_budgets_per_tool(self):
         self.assertEqual(server.DEFAULT_DETAIL["ground_ui_element"], "precise")
-        self.assertEqual(self.inspect_size("transcribe_screen_text")[0], 768)
+        self.assertEqual(self.inspect_size("transcribe_screen_text")[0], 1024)
         self.assertEqual(self.inspect_size("inspect_image_file", prompt="p")[0], 1024)
 
     def test_unknown_detail_is_an_error(self):
@@ -175,6 +175,30 @@ class TestBudgets(ToolTestCase):
     def test_env_overrides_a_budget(self):
         with mock.patch.dict("os.environ", {"VLM_READ_PX": "640"}):
             self.assertEqual(self.inspect_size("inspect_image_file", prompt="p", detail="read")[0], 640)
+
+
+class TestShrinkNoteForReading(ToolTestCase):
+    """A downscaled full screen cannot read small text (0/36 codes at 768 px, 12/36 at 1024 px on a 1080p canvas,
+    36/36 from a native crop), so the reply must say so when the image was shrunk a lot."""
+
+    def transcribe(self, size, **args):
+        path = Path(self.tmp.name) / f"big_{size[0]}.png"
+        Image.new("RGB", size, "white").save(path)
+        with mock.patch.object(vlm_client, "query_vlm", return_value=ok("some text")):
+            r = server.handle_tool_call("transcribe_screen_text", {"image_path": str(path), **args})
+        return r["content"][0]["text"]
+
+    def test_large_canvas_gets_a_shrink_note_pointing_to_crop_bbox(self):
+        text = self.transcribe((2560, 1440))
+        self.assertIn("shrunk", text)
+        self.assertIn("crop_bbox", text)
+        self.assertIn("2.5x", text)
+
+    def test_small_canvas_has_no_note(self):
+        self.assertNotIn("shrunk", self.transcribe((1280, 800)))
+
+    def test_a_native_crop_has_no_note(self):
+        self.assertNotIn("shrunk", self.transcribe((2560, 1440), crop_bbox=[0, 0, 200, 200]))
 
 
 class TestFrameReuse(unittest.TestCase):
